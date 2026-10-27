@@ -21,9 +21,7 @@ __all__ = ["replace_module_parallel"]
 T = TypeVar("T", bound=torch.nn.Module)
 
 
-def _broadcast_direct_state_dict(
-    state_dict: TensorStateDict, src: int
-) -> None:
+def _broadcast_direct_state_dict(state_dict: TensorStateDict, src: int) -> None:
     """Broadcast a direct state dict without pickling its tensor data.
 
     Receivers allocate tensors from the source metadata because meta-device
@@ -66,9 +64,7 @@ def _broadcast_direct_state_dict(
             received_state_dict[name] = None
             continue
 
-        tensor_device_type, tensor_dtype, tensor_shape, tensor_stride = (
-            tensor_metadata
-        )
+        tensor_device_type, tensor_dtype, tensor_shape, tensor_stride = tensor_metadata
         if tensor_device_type in ("cuda", "xpu"):
             tensor_device = torch.device(
                 tensor_device_type, torch.accelerator.current_device_index()
@@ -170,5 +166,7 @@ def replace_module_parallel(
 
         else:
             broadcast_obj = [get_direct_state_dict(module)]
-            received_state_dict = _broadcast_direct_state_dict(broadcast_obj[0], assigned_rank[module])
+            received_state_dict = _broadcast_direct_state_dict(
+                broadcast_obj[0], assigned_rank[module]
+            )
             replace_direct_state_dict(module, received_state_dict)
