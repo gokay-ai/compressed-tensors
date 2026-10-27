@@ -20,6 +20,88 @@ __all__ = ["replace_module_parallel"]
 T = TypeVar("T", bound=torch.nn.Module)
 
 
+def _broadcast_direct_state_dict(module: torch.nn.Module, src: int) -> None:
+    """Broadcast direct module tensors without pickling tensor storage.
+
+    Object collectives serialize tensors with pickle. Some dtypes, including FP8,
+    use untyped storage that the legacy serialization loader cannot restore. Send
+    only tensor metadata through the object collective, then broadcast tensor bytes.
+    """
+    rank = dist.get_rank()
+    if rank == src:
+        state_dict = get_direct_state_dict(module)
+        metadata = [
+            (
+                name,
+                None
+                if tensor is None
+                else (
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    str(tensor.dtype).removeprefix("torch."),
+                    tensor.device.type,
+                ),
+            )
+            for name, tensor in state_dict.items()
+        ]
+    else:
+        state_dict = {}
+        metadata = None
+
+    metadata_list = [metadata]
+    dist.broadcast_object_list(metadata_list, src=src)
+    metadata = metadata_list[0]
+
+    backend = str(dist.get_backend()).lower()
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if "nccl" in backend
+        else torch.device("cpu")
+    )
+    received_state_dict = {}
+    for name, tensor_metadata in metadata:
+        if tensor_metadata is None:
+            received_state_dict[name] = None
+            continue
+
+        shape, stride, dtype_name, tensor_device_type = tensor_metadata
+        dtype = getattr(torch, dtype_name)
+        numel = torch.Size(shape).numel()
+        num_bytes = numel * torch.empty((), dtype=dtype).element_size()
+        if tensor_device_type == "cuda":
+            tensor_device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            tensor_device = torch.device(tensor_device_type)
+
+        if rank == src:
+            tensor = state_dict[name]
+            payload = (
+                tensor.detach().contiguous().reshape(-1).view(torch.uint8).reshape(-1)
+            )
+            if payload.device != device:
+                payload = payload.to(device)
+        else:
+            payload = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+
+        if num_bytes > 0:
+            dist.broadcast(payload, src=src)
+
+        if rank == src:
+            received_state_dict[name] = state_dict[name]
+        else:
+            tensor = payload.view(dtype).reshape(shape).to(tensor_device)
+            if tuple(tensor.stride()) != tuple(stride):
+                strided_tensor = torch.empty_strided(
+                    shape, stride, dtype=dtype, device=tensor_device
+                )
+                strided_tensor.copy_(tensor)
+                tensor = strided_tensor
+            received_state_dict[name] = tensor
+
+    if rank != src:
+        replace_direct_state_dict(module, received_state_dict)
+
+
 def replace_module_parallel(
     modules: list[T],
     apply_fn: Callable[[T], None],
@@ -85,6 +167,4 @@ def replace_module_parallel(
                 }
 
         else:
-            broadcast_obj = [get_direct_state_dict(module)]
-            dist.broadcast_object_list(broadcast_obj, src=assigned_rank[module])
-            replace_direct_state_dict(module, broadcast_obj[0])
+            _broadcast_direct_state_dict(module, assigned_rank[module])
