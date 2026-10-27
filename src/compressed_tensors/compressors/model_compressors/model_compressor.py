@@ -26,7 +26,6 @@ from compressed_tensors.offload import (
     is_distributed,
 )
 from compressed_tensors.quantization import QuantizationConfig, QuantizationStatus
-from compressed_tensors.quantization.utils.helpers import is_module_quantized
 from compressed_tensors.transform import TransformConfig
 from tqdm import tqdm
 from transformers import CompressedTensorsConfig
@@ -34,6 +33,11 @@ from transformers.file_utils import CONFIG_NAME
 
 
 __all__ = ["ModelCompressor"]
+
+
+def _has_weight_quantization(module: torch.nn.Module) -> bool:
+    scheme = getattr(module, "quantization_scheme", None)
+    return getattr(scheme, "weights", None) is not None
 
 
 class ModelCompressor:
@@ -147,13 +151,13 @@ class ModelCompressor:
             During load, all modules need to be compressed, whereas during save modules
             already compressed should be excluded.
         """
-        # Collect all quantized modules
+        # Only weight-quantized modules have state for a module compressor to pack.
         desc = "Compressing model"
         modules = [
             module
             for _, module in model.named_modules(remove_duplicate=True)
             if (
-                is_module_quantized(module)
+                _has_weight_quantization(module)
                 and (
                     not (skip_compressed)
                     or getattr(module, "quantization_status", None)
@@ -194,7 +198,7 @@ class ModelCompressor:
         modules = [
             module
             for _, module in model.named_modules(remove_duplicate=True)
-            if is_module_quantized(module)
+            if _has_weight_quantization(module)
         ]
 
         # Decompress modules using distributed or sequential

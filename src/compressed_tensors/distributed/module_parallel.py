@@ -24,74 +24,67 @@ def _broadcast_direct_state_dict(module: torch.nn.Module, src: int) -> None:
     """Broadcast direct module tensors without pickling tensor storage.
 
     Object collectives pickle tensors, and FP8 tensor storage fails to round-trip
-    through PyTorch's legacy loader. Broadcast only metadata as an object, then send
-    the tensors through tensor collectives.
+    through PyTorch's legacy loader. Non-source ranks already have matching meta
+    tensors, so broadcast only their source device types before sending tensor data.
     """
     rank = dist.get_rank()
+    state_dict = get_direct_state_dict(module)
     if rank == src:
-        state_dict = get_direct_state_dict(module)
-        metadata = [
-            (
-                name,
-                None
-                if tensor is None
-                else (
-                    tuple(tensor.shape),
-                    tuple(tensor.stride()),
-                    str(tensor.dtype).removeprefix("torch."),
-                    tensor.device.type,
-                ),
-            )
+        tensor_metadata = [
+            (name, None if tensor is None else tensor.device.type)
             for name, tensor in state_dict.items()
         ]
     else:
-        state_dict = {}
-        metadata = None
+        tensor_metadata = None
 
-    metadata_list = [metadata]
-    dist.broadcast_object_list(metadata_list, src=src)
-    metadata = metadata_list[0]
+    tensor_metadata_list = [tensor_metadata]
+    dist.broadcast_object_list(tensor_metadata_list, src=src)
+    tensor_metadata = tensor_metadata_list[0]
 
     backend = str(dist.get_backend()).lower()
-    device = (
-        torch.device("cuda", torch.accelerator.current_device_index())
-        if "nccl" in backend
-        else torch.device("cpu")
-    )
+    if "nccl" in backend:
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+    elif "xccl" in backend:
+        device = torch.device("xpu", torch.accelerator.current_device_index())
+    else:
+        device = torch.device("cpu")
+
     received_state_dict = {}
-    for name, tensor_metadata in metadata:
-        if tensor_metadata is None:
+    for name, tensor_device_type in tensor_metadata:
+        tensor = state_dict[name]
+        if tensor_device_type is None:
+            assert tensor is None
             received_state_dict[name] = None
             continue
 
-        shape, stride, dtype_name, tensor_device_type = tensor_metadata
-        dtype = getattr(torch, dtype_name)
-        if tensor_device_type == "cuda":
+        assert tensor is not None
+        if tensor_device_type in ("cuda", "xpu"):
             tensor_device = torch.device(
-                "cuda", torch.accelerator.current_device_index()
+                tensor_device_type, torch.accelerator.current_device_index()
             )
         else:
             tensor_device = torch.device(tensor_device_type)
 
         if rank == src:
-            payload = state_dict[name].detach().to(device).contiguous()
+            payload = tensor.detach().to(device).contiguous()
         else:
-            payload = torch.empty(shape, dtype=dtype, device=device)
+            payload = torch.empty(tensor.shape, dtype=tensor.dtype, device=device)
 
         if payload.numel() > 0:
             dist.broadcast(as_broadcastable(payload), src=src)
 
-        if rank == src:
-            received_state_dict[name] = state_dict[name]
-        else:
-            tensor = payload.to(tensor_device)
-            if tuple(tensor.stride()) != tuple(stride):
+        if rank != src:
+            received_tensor = payload.to(tensor_device)
+            if tuple(received_tensor.stride()) != tuple(tensor.stride()):
                 strided_tensor = torch.empty_strided(
-                    shape, stride, dtype=dtype, device=tensor_device
+                    tensor.shape,
+                    tensor.stride(),
+                    dtype=tensor.dtype,
+                    device=tensor_device,
                 )
-                strided_tensor.copy_(tensor)
-                tensor = strided_tensor
-            received_state_dict[name] = tensor
+                strided_tensor.copy_(received_tensor)
+                received_tensor = strided_tensor
+            received_state_dict[name] = received_tensor
 
     if rank != src:
         replace_direct_state_dict(module, received_state_dict)
