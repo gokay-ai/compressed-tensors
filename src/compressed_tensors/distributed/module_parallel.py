@@ -22,7 +22,7 @@ T = TypeVar("T", bound=torch.nn.Module)
 
 
 def _broadcast_direct_state_dict(
-    broadcast_obj: list[TensorStateDict], src: int
+    state_dict: TensorStateDict, src: int
 ) -> None:
     """Broadcast a direct state dict without pickling its tensor data.
 
@@ -30,7 +30,6 @@ def _broadcast_direct_state_dict(
     transforms can produce approximate shapes or layouts.
     """
     rank = dist.get_rank()
-    state_dict = broadcast_obj[0]
     if rank == src:
         metadata = [
             (
@@ -102,7 +101,7 @@ def _broadcast_direct_state_dict(
         else:
             received_state_dict[name] = tensor
 
-    broadcast_obj[0] = received_state_dict
+    return received_state_dict
 
 
 def replace_module_parallel(
@@ -171,5 +170,5 @@ def replace_module_parallel(
 
         else:
             broadcast_obj = [get_direct_state_dict(module)]
-            _broadcast_direct_state_dict(broadcast_obj, assigned_rank[module])
-            replace_direct_state_dict(module, broadcast_obj[0])
+            received_state_dict = _broadcast_direct_state_dict(broadcast_obj[0], assigned_rank[module])
+            replace_direct_state_dict(module, received_state_dict)
