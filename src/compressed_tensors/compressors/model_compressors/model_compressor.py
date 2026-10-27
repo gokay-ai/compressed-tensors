@@ -26,6 +26,7 @@ from compressed_tensors.offload import (
     is_distributed,
 )
 from compressed_tensors.quantization import QuantizationConfig, QuantizationStatus
+from compressed_tensors.quantization.utils.helpers import is_module_quantized
 from compressed_tensors.transform import TransformConfig
 from tqdm import tqdm
 from transformers import CompressedTensorsConfig
@@ -33,11 +34,6 @@ from transformers.file_utils import CONFIG_NAME
 
 
 __all__ = ["ModelCompressor"]
-
-
-def _has_weight_quantization(module: torch.nn.Module) -> bool:
-    scheme = getattr(module, "quantization_scheme", None)
-    return getattr(scheme, "weights", None) is not None
 
 
 class ModelCompressor:
@@ -151,13 +147,13 @@ class ModelCompressor:
             During load, all modules need to be compressed, whereas during save modules
             already compressed should be excluded.
         """
-        # Only weight-quantized modules have state for a module compressor to pack.
+        # Collect all quantized modules
         desc = "Compressing model"
         modules = [
             module
             for _, module in model.named_modules(remove_duplicate=True)
             if (
-                _has_weight_quantization(module)
+                is_module_quantized(module)
                 and (
                     not (skip_compressed)
                     or getattr(module, "quantization_status", None)
@@ -198,7 +194,7 @@ class ModelCompressor:
         modules = [
             module
             for _, module in model.named_modules(remove_duplicate=True)
-            if _has_weight_quantization(module)
+            if is_module_quantized(module)
         ]
 
         # Decompress modules using distributed or sequential
@@ -241,16 +237,6 @@ class ModelCompressor:
             if self.quantization_config is not None
             else {}
         )
-        if (
-            qconfig_data
-            and not qconfig_data["config_groups"]
-            and qconfig_data["kv_cache_scheme"] is not None
-        ):
-            # Transformers' compressed-tensors integration assumes there is at least
-            # one config group when resolving the experts' weight scheme. A KV-cache-
-            # only model has no weight groups, so serialize a no-op group for it.
-            qconfig_data["config_groups"] = {"kv_cache_only": {"targets": []}}
-
         tconfig_data = (
             self.transform_config.model_dump()
             if self.transform_config is not None
