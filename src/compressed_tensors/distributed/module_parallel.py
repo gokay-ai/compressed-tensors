@@ -24,12 +24,26 @@ T = TypeVar("T", bound=torch.nn.Module)
 def _broadcast_direct_state_dict(
     broadcast_obj: list[TensorStateDict], src: int
 ) -> None:
-    """Broadcast the tensors in a direct state dict without pickling them."""
+    """Broadcast a direct state dict without pickling its tensor data.
+
+    Receivers allocate tensors from the source metadata because meta-device
+    transforms can produce approximate shapes or layouts.
+    """
     rank = dist.get_rank()
     state_dict = broadcast_obj[0]
     if rank == src:
         metadata = [
-            (name, None if tensor is None else tensor.device.type)
+            (
+                name,
+                None
+                if tensor is None
+                else (
+                    tensor.device.type,
+                    tensor.dtype,
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                ),
+            )
             for name, tensor in state_dict.items()
         ]
     else:
@@ -47,12 +61,15 @@ def _broadcast_direct_state_dict(
     else:
         device = torch.device("cpu")
 
-    for name, tensor_device_type in metadata:
-        tensor = state_dict[name]
-        if tensor_device_type is None:
-            state_dict[name] = None
+    received_state_dict: TensorStateDict = {}
+    for name, tensor_metadata in metadata:
+        if tensor_metadata is None:
+            received_state_dict[name] = None
             continue
 
+        tensor_device_type, tensor_dtype, tensor_shape, tensor_stride = (
+            tensor_metadata
+        )
         if tensor_device_type in ("cuda", "xpu"):
             tensor_device = torch.device(
                 tensor_device_type, torch.accelerator.current_device_index()
@@ -61,26 +78,31 @@ def _broadcast_direct_state_dict(
             tensor_device = torch.device(tensor_device_type)
 
         if rank == src:
+            tensor = state_dict[name]
             assert tensor is not None
             payload = tensor.detach().to(device).contiguous()
         else:
-            payload = torch.empty(tensor.shape, dtype=tensor.dtype, device=device)
+            payload = torch.empty(tensor_shape, dtype=tensor_dtype, device=device)
 
         if payload.numel() > 0:
             dist.broadcast(as_broadcastable(payload), src=src)
 
         if rank != src:
             received_tensor = payload.to(tensor_device)
-            if tuple(received_tensor.stride()) != tuple(tensor.stride()):
+            if tuple(received_tensor.stride()) != tensor_stride:
                 strided_tensor = torch.empty_strided(
-                    tensor.shape,
-                    tensor.stride(),
-                    dtype=tensor.dtype,
+                    tensor_shape,
+                    tensor_stride,
+                    dtype=tensor_dtype,
                     device=tensor_device,
                 )
                 strided_tensor.copy_(received_tensor)
                 received_tensor = strided_tensor
-            state_dict[name] = received_tensor
+            received_state_dict[name] = received_tensor
+        else:
+            received_state_dict[name] = tensor
+
+    broadcast_obj[0] = received_state_dict
 
 
 def replace_module_parallel(
