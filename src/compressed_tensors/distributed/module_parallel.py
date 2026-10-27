@@ -6,7 +6,7 @@ from typing import Callable, Optional, TypeVar
 import torch
 import torch.distributed as dist
 from compressed_tensors.distributed.assign import greedy_bin_packing
-from compressed_tensors.distributed.utils import set_source_process
+from compressed_tensors.distributed.utils import as_broadcastable, set_source_process
 from compressed_tensors.offload.utils import as_single_threaded, module_size
 from compressed_tensors.utils.module import (
     get_direct_state_dict,
@@ -23,9 +23,9 @@ T = TypeVar("T", bound=torch.nn.Module)
 def _broadcast_direct_state_dict(module: torch.nn.Module, src: int) -> None:
     """Broadcast direct module tensors without pickling tensor storage.
 
-    Object collectives serialize tensors with pickle. Some dtypes, including FP8,
-    use untyped storage that the legacy serialization loader cannot restore. Send
-    only tensor metadata through the object collective, then broadcast tensor bytes.
+    Object collectives pickle tensors, and FP8 tensor storage fails to round-trip
+    through PyTorch's legacy loader. Broadcast only metadata as an object, then send
+    the tensors through tensor collectives.
     """
     rank = dist.get_rank()
     if rank == src:
@@ -66,30 +66,23 @@ def _broadcast_direct_state_dict(module: torch.nn.Module, src: int) -> None:
 
         shape, stride, dtype_name, tensor_device_type = tensor_metadata
         dtype = getattr(torch, dtype_name)
-        numel = torch.Size(shape).numel()
-        num_bytes = numel * torch.empty((), dtype=dtype).element_size()
         if tensor_device_type == "cuda":
             tensor_device = torch.device("cuda", torch.cuda.current_device())
         else:
             tensor_device = torch.device(tensor_device_type)
 
         if rank == src:
-            tensor = state_dict[name]
-            payload = (
-                tensor.detach().contiguous().reshape(-1).view(torch.uint8).reshape(-1)
-            )
-            if payload.device != device:
-                payload = payload.to(device)
+            payload = state_dict[name].detach().to(device).contiguous()
         else:
-            payload = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+            payload = torch.empty(shape, dtype=dtype, device=device)
 
-        if num_bytes > 0:
-            dist.broadcast(payload, src=src)
+        if payload.numel() > 0:
+            dist.broadcast(as_broadcastable(payload), src=src)
 
         if rank == src:
             received_state_dict[name] = state_dict[name]
         else:
-            tensor = payload.view(dtype).reshape(shape).to(tensor_device)
+            tensor = payload.to(tensor_device)
             if tuple(tensor.stride()) != tuple(stride):
                 strided_tensor = torch.empty_strided(
                     shape, stride, dtype=dtype, device=tensor_device
