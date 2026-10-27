@@ -237,6 +237,16 @@ class ModelCompressor:
             if self.quantization_config is not None
             else {}
         )
+        if (
+            qconfig_data
+            and not qconfig_data["config_groups"]
+            and qconfig_data["kv_cache_scheme"] is not None
+        ):
+            # Transformers' compressed-tensors integration assumes there is at least
+            # one config group when resolving the experts' weight scheme. A KV-cache-
+            # only model has no weight groups, so serialize a no-op group for it.
+            qconfig_data["config_groups"] = {"kv_cache_only": {"targets": []}}
+
         tconfig_data = (
             self.transform_config.model_dump()
             if self.transform_config is not None

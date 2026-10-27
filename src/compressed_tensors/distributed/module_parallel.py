@@ -54,7 +54,7 @@ def _broadcast_direct_state_dict(module: torch.nn.Module, src: int) -> None:
 
     backend = str(dist.get_backend()).lower()
     device = (
-        torch.device("cuda", torch.cuda.current_device())
+        torch.device("cuda", torch.accelerator.current_device_index())
         if "nccl" in backend
         else torch.device("cpu")
     )
@@ -67,7 +67,9 @@ def _broadcast_direct_state_dict(module: torch.nn.Module, src: int) -> None:
         shape, stride, dtype_name, tensor_device_type = tensor_metadata
         dtype = getattr(torch, dtype_name)
         if tensor_device_type == "cuda":
-            tensor_device = torch.device("cuda", torch.cuda.current_device())
+            tensor_device = torch.device(
+                "cuda", torch.accelerator.current_device_index()
+            )
         else:
             tensor_device = torch.device(tensor_device_type)
 
