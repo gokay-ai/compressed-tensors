@@ -12,6 +12,7 @@ from compressed_tensors.utils.module import (
     get_direct_state_dict,
     replace_direct_state_dict,
 )
+from compressed_tensors.utils.type import TensorStateDict
 from tqdm import tqdm
 
 
@@ -20,26 +21,23 @@ __all__ = ["replace_module_parallel"]
 T = TypeVar("T", bound=torch.nn.Module)
 
 
-def _broadcast_direct_state_dict(module: torch.nn.Module, src: int) -> None:
-    """Broadcast direct module tensors without pickling tensor storage.
-
-    Object collectives pickle tensors, and FP8 tensor storage fails to round-trip
-    through PyTorch's legacy loader. Non-source ranks already have matching meta
-    tensors, so broadcast only their source device types before sending tensor data.
-    """
+def _broadcast_direct_state_dict(
+    broadcast_obj: list[TensorStateDict], src: int
+) -> None:
+    """Broadcast the tensors in a direct state dict without pickling them."""
     rank = dist.get_rank()
-    state_dict = get_direct_state_dict(module)
+    state_dict = broadcast_obj[0]
     if rank == src:
-        tensor_metadata = [
+        metadata = [
             (name, None if tensor is None else tensor.device.type)
             for name, tensor in state_dict.items()
         ]
     else:
-        tensor_metadata = None
+        metadata = None
 
-    tensor_metadata_list = [tensor_metadata]
-    dist.broadcast_object_list(tensor_metadata_list, src=src)
-    tensor_metadata = tensor_metadata_list[0]
+    metadata_obj = [metadata]
+    dist.broadcast_object_list(metadata_obj, src=src)
+    metadata = metadata_obj[0]
 
     backend = str(dist.get_backend()).lower()
     if "nccl" in backend:
@@ -49,15 +47,12 @@ def _broadcast_direct_state_dict(module: torch.nn.Module, src: int) -> None:
     else:
         device = torch.device("cpu")
 
-    received_state_dict = {}
-    for name, tensor_device_type in tensor_metadata:
+    for name, tensor_device_type in metadata:
         tensor = state_dict[name]
         if tensor_device_type is None:
-            assert tensor is None
-            received_state_dict[name] = None
+            state_dict[name] = None
             continue
 
-        assert tensor is not None
         if tensor_device_type in ("cuda", "xpu"):
             tensor_device = torch.device(
                 tensor_device_type, torch.accelerator.current_device_index()
@@ -66,6 +61,7 @@ def _broadcast_direct_state_dict(module: torch.nn.Module, src: int) -> None:
             tensor_device = torch.device(tensor_device_type)
 
         if rank == src:
+            assert tensor is not None
             payload = tensor.detach().to(device).contiguous()
         else:
             payload = torch.empty(tensor.shape, dtype=tensor.dtype, device=device)
@@ -84,10 +80,7 @@ def _broadcast_direct_state_dict(module: torch.nn.Module, src: int) -> None:
                 )
                 strided_tensor.copy_(received_tensor)
                 received_tensor = strided_tensor
-            received_state_dict[name] = received_tensor
-
-    if rank != src:
-        replace_direct_state_dict(module, received_state_dict)
+            state_dict[name] = received_tensor
 
 
 def replace_module_parallel(
@@ -155,4 +148,6 @@ def replace_module_parallel(
                 }
 
         else:
-            _broadcast_direct_state_dict(module, assigned_rank[module])
+            broadcast_obj = [get_direct_state_dict(module)]
+            _broadcast_direct_state_dict(broadcast_obj, assigned_rank[module])
+            replace_direct_state_dict(module, broadcast_obj[0])
